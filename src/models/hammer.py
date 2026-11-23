@@ -17,50 +17,63 @@ from src.models.point_model.pointnet2 import (
 )
 from src.models.decoder.transformer import CrossAttnBlock
     
-
+"""
+一个只用于交换维度的模块，因为nn.Sequential 里只能放模块，而 x.transpose(1, 2) 是个普通方法，没法直接塞进去。
+"""
 class SwapAxes(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, x):
-        return x.transpose(1, 2)
+    def forward(self, x): # 输入x
+        return x.transpose(1, 2) 
+        # 交换维度，代码里 transpose(1, 2) 特别多，只是因为两套布局要切换：PointNet++ 的 Conv1d 用 [B, C, N]（通道在前），Transformer / nn.Linear 用 [B, N, C]（点数在前）。
     
 
+"""
+点云主干网络
+输入：3D点云xyz、Qwen2.5-VL隐藏状态hidden_states
+输出：四个尺度的逐点特征[feat_3, feat_2, feat_1, feat_0]
+"""
 class PointBackbone(nn.Module):
+    # init函数负责负责按传入的超参数搭好网络骨架，不处理数据，真正跑数据在forward里
     def __init__(self, emb_dim, normal_channel, additional_channel, N_p, latent_out_dim):
         super().__init__()
         self.N_p = N_p
         self.normal_channel = normal_channel
-        # downsampling layers
+
+        # downsampling layers，输入2048×3，输出64×512
         self.sa1 = PointNetSetAbstractionMsg(
-            npoint=512,
-            radius_list=[0.1, 0.2, 0.4],
-            nsample_list=[32, 64, 128],
+            npoint=512, # 把原始点云降采样到512个点
+            radius_list=[0.1, 0.2, 0.4], # 每个中心点有三个球半径，分别是0.1、0.2、0.4
+            nsample_list=[32, 64, 128], # 每个中心点球内采样32、64、128个点，不够就用球内索引最小的点填充，涉及到FPS方法
             in_channel=3,
-            mlp_list=[[32, 32, 64], [64, 64, 128], [64, 96, 128]]
+            mlp_list=[[32, 32, 64], [64, 64, 128], [64, 96, 128]] # 经验配置，论文和官方实现里，SA 层的局部 PointNet 通常就是 2~3 层 MLP；小尺度通道给64，大尺度给128（要考虑算力、能力）；对于第三个中间是96基本是 PointNet++ 官方 MSG 实现的经典配置被直接沿用；作者只是沿用了"最大尺度分支多给一点中间宽度"的习惯
         )
         self.sa2 = PointNetSetAbstractionMsg(
             npoint=128,
             radius_list=[0.4, 0.8],
             nsample_list=[64, 128],
-            in_channel=128+128+64,
+            in_channel=128+128+64, # 直接concat拼接多个尺度
             mlp_list=[[128, 128, 256], [128, 196, 256]]
         )
         self.sa3 = PointNetSetAbstractionMsg(
-            npoint=self.N_p,
+            npoint=self.N_p, # N_P设置为了64
             radius_list=[0.2, 0.4],
             nsample_list=[16, 32],
             in_channel=256+256,
             mlp_list=[[128, 128, 256], [128, 196, 256]]
         )
 
-        self.attend = CrossAttnBlock(
-            embedding_dim=emb_dim,
+        # 初始化交叉注意力模块，forword让点云每个点去提问
+        self.attend = CrossAttnBlock( 
+            embedding_dim=emb_dim, # 512
             num_heads=8,
             mlp_dim=1024,
-            activation=nn.GELU,
+            activation=nn.GELU, # GELU是平滑版ReLU激活函数
             attention_downsample_rate=2,
         )
+
+        # 投影头，结构上类似FNN：hidden_states 是 VLM 最后一层隐状态经投影得到的，宽度是 latent_out_dim=256；点云和注意力侧是 emb_dim=512，需要进行FNN
         self.proj = nn.Sequential(
             nn.Linear(latent_out_dim, emb_dim),
             nn.ReLU(),
@@ -69,23 +82,26 @@ class PointBackbone(nn.Module):
 
         # upsampling layers
         self.fp3 = PointNetFeaturePropagation(
-            in_channel=512+emb_dim, mlp=[768, 512]
+            in_channel=512+emb_dim, mlp=[768, 512] # 插值：in_channel = sa2输出channel + sa3输出channel ，mlp=[768, 512]把in_channel降到768再降到512
         )
         self.fp2 = PointNetFeaturePropagation(
-            in_channel=832, mlp=[768, 512]
+            in_channel=832, mlp=[768, 512] # 832 = sa1输出channel + sa2输出channel，也是降到512
         )
         self.fp1 = PointNetFeaturePropagation(
-            in_channel=518+additional_channel, mlp=[512, 512]
+            in_channel=518+additional_channel, mlp=[512, 512] # pointnet++常见做法512+3+3
         )
 
+        # 特征融合头，结构上类似FNN
         self.feat_proj = nn.Sequential(
             nn.Linear(2*emb_dim, emb_dim),
             nn.ReLU(),
             nn.Linear(emb_dim, emb_dim),
         )
+
+        # 参数
         self.soft_weights = nn.Linear(emb_dim, 1, bias=False)
 
-    def forward(self, xyz, hidden_states):
+    def forward(self, xyz, hidden_states): # 输入3D点云xyz、Qwen2.5-VL隐藏状态hidden_states
         if self.normal_channel:
             feat_0 = xyz
             xyz_0 = xyz[:, :3, :]
@@ -97,9 +113,9 @@ class PointBackbone(nn.Module):
         xyz_2, feat_2 = self.sa2(xyz_1, feat_1) # [B, 3, npoint_sa2] --- [B, 512, npoint_sa2]
         xyz_3, feat_3 = self.sa3(xyz_2, feat_2) # [B, 3, N_p] --- [B, 512, N_p]
 
-        h = self.proj(hidden_states)
+        h = self.proj(hidden_states) # [B, L, latent_out_dim] --- [B, L, 512]
 
-        feat_3 = self.attend(feat_3.transpose(1, 2), h)
+        feat_3 = self.attend(feat_3.transpose(1, 2), h) # 交换维度，因为pointnet++的conv1d是[B, C, N]
         feat_3 = feat_3.transpose(1, 2) # [B, emb_dim, N_p]
 
         feat_2 = self.fp3(xyz_2, xyz_3, feat_2, feat_3)
@@ -107,16 +123,18 @@ class PointBackbone(nn.Module):
         feat_0 = self.fp1(xyz_0, xyz_1, torch.cat([xyz_0, feat_0], 1), feat_1)
 
         feat_0 = feat_0.transpose(1, 2)
-        scores = self.soft_weights(h)
-        weights = F.softmax(scores, dim=1)
-        avg_h = torch.sum(weights * h, dim=1, keepdim=True)
-        avg_h = avg_h.repeat(1, feat_0.shape[1], 1)
-        feat_0 = torch.cat([feat_0, avg_h], dim=-1)
-        feat_0 = self.feat_proj(feat_0)
 
-        feat_1 = feat_1.transpose(1, 2)
-        feat_2 = feat_2.transpose(1, 2)
-        feat_3 = feat_3.transpose(1, 2)
+        scores = self.soft_weights(h) # [B, L, 1]，h的每个token一个分数
+        weights = F.softmax(scores, dim=1) #  [B, L, 1]，归一化，权重之和为1
+        avg_h = torch.sum(weights * h, dim=1, keepdim=True) # [B, L, 512]
+        avg_h = avg_h.repeat(1, feat_0.shape[1], 1)# [B, 1, 512] ，整句话变为一个向量
+
+        feat_0 = torch.cat([feat_0, avg_h], dim=-1)# [B, N_p, 1024]
+        feat_0 = self.feat_proj(feat_0)# [B, 2048, 512]
+
+        feat_1 = feat_1.transpose(1, 2) # [B, 512, 512]
+        feat_2 = feat_2.transpose(1, 2) # [B, 128, 512]
+        feat_3 = feat_3.transpose(1, 2) # [B, 64, 512]
 
         return [feat_3, feat_2, feat_1, feat_0]
     
